@@ -11,8 +11,7 @@ Algorithm: SMA(1000) Momentum Crossover on VN30F1M
 """
 
 import numpy as np
-from datetime import timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import List, Optional
 from collections import deque
 import pandas as pd
@@ -25,10 +24,10 @@ from utils import get_expired_dates, from_cash_to_tradeable_contracts, round_dec
 FEE_PER_CONTRACT = Decimal(BACKTESTING_CONFIG["fee"]) * Decimal('100')
 
 # ---------- Strategy constants ----------
-SMA_WINDOW   = 1000          # number of ticks for the moving average
-TP_POINTS    = Decimal('3')  # take-profit threshold in index points
-SL_POINTS    = Decimal('2')  # stop-loss threshold in index points (magnitude)
-MULTIPLIER   = Decimal('100')  # VND per index point per contract
+SMA_WINDOW = 1000
+TP_POINTS  = Decimal('3')
+SL_POINTS  = Decimal('2')
+MULTIPLIER = Decimal('100')
 
 
 class Backtesting:
@@ -41,44 +40,40 @@ class Backtesting:
     - Sell when prev_tick > SMA and cur_tick <= SMA  → Limit Sell at floor   (-1 tick).
     - Position size: exactly 1 contract long or 1 contract short.
     - Take-Profit at +3 points unrealised P&L (per contract × multiplier).
-    - Stop-Loss   at -1 point  unrealised P&L (per contract × multiplier).
+    - Stop-Loss   at -2 points unrealised P&L (per contract × multiplier).
     - End-of-day: any open position is force-closed at the daily closing price (ATC rule).
     """
 
-    def __init__(
-        self,
-        capital: Decimal,
-        printable=True,
-    ):
+    def __init__(self, capital: Decimal, printable=True):
         self.printable = printable
-        self.metric = None
+        self.metric    = None
 
-        # --- position state ---
-        self.inventory: int = 0          # +1 = long 1 contract, -1 = short 1 contract
-        self.entry_price: Optional[Decimal] = None  # price at which we entered
+        # --- Position state ---
+        self.inventory:   int               = 0
+        self.entry_price: Optional[Decimal] = None
 
         # --- P&L / NAV tracking ---
-        self.realised_pnl: Decimal = Decimal('0')   # cumulative realised P&L within the day
-        self.daily_assets: List[Decimal] = [capital]
-        self.daily_returns: List[Decimal] = []
-        self.tracking_dates: list = []
-        self.daily_inventory: list = []
-        self.monthly_tracking: list = []
+        self.realised_pnl:    Decimal       = Decimal('0')
+        self.daily_assets:    List[Decimal] = [capital]
+        self.daily_returns:   List[Decimal] = []
+        self.tracking_dates:  list          = []
+        self.daily_inventory: list          = []
+        self.monthly_tracking: list         = []
 
-        # --- SMA(1000) rolling window ---
-        self._price_window: deque = deque(maxlen=SMA_WINDOW)
-        self._prev_price: Optional[Decimal] = None   # last tick price (for crossover detection)
-        self._prev_sma: Optional[Decimal] = None     # SMA value at the previous tick
+        # --- SMA rolling window ---
+        self._price_window: deque           = deque(maxlen=SMA_WINDOW)
+        self._prev_price:   Optional[Decimal] = None
+        self._prev_sma:     Optional[Decimal] = None
 
-        # --- roll-over F1→F2 support (kept for process_data compatibility) ---
+        # --- roll-over F1→F2 support ---
         self.old_timestamp = None
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Private helpers (mirrors LiveSMABot)
     # ------------------------------------------------------------------
 
     def _current_sma(self) -> Optional[Decimal]:
-        """Return SMA(1000) if enough data, else None."""
+        """Return SMA(1000) if the window is full, else None."""
         if len(self._price_window) < SMA_WINDOW:
             return None
         return sum(self._price_window) / Decimal(SMA_WINDOW)
@@ -92,7 +87,7 @@ class Backtesting:
 
     def _open_position(self, direction: int, price: Decimal):
         """Open a new 1-contract position."""
-        self.inventory = direction
+        self.inventory   = direction
         self.entry_price = price
 
     def _close_position(self, price: Decimal):
@@ -101,31 +96,78 @@ class Backtesting:
             return
         direction = Decimal('1') if self.inventory > 0 else Decimal('-1')
         gross = direction * (price - self.entry_price) * MULTIPLIER
-        self.realised_pnl += gross - FEE_PER_CONTRACT   # one fee per close trade
-        self.inventory = 0
+        self.realised_pnl += gross - FEE_PER_CONTRACT
+        self.inventory   = 0
         self.entry_price = None
 
     # ------------------------------------------------------------------
-    # Daily P&L snapshot (called at end-of-day)
+    # Tick-level checks (mirrors LiveSMABot tick-level helpers)
+    # ------------------------------------------------------------------
+
+    def _check_tp_sl(self, tick_price: Decimal) -> bool:
+        """
+        Close the position if TP or SL is hit.
+        Returns True if the position was closed (caller should skip entry signals
+        for this tick — mirrors live bot behaviour of not re-entering same tick).
+        """
+        if self.inventory == 0:
+            return False
+
+        upnl = self._unrealised_pnl(tick_price)
+
+        if upnl >= TP_POINTS * MULTIPLIER:
+            self._close_position(tick_price)
+            return True
+
+        if upnl <= -SL_POINTS * MULTIPLIER:
+            self._close_position(tick_price)
+            return True
+
+        return False
+
+    def _check_signals(self, tick_price: Decimal, cur_sma: Decimal):
+        """
+        Generate crossover entry signals when flat.
+        Mirrors LiveSMABot._check_signals — only called when no TP/SL fired
+        this tick, so same-tick re-entry after a close is prevented.
+        """
+        if self.inventory != 0:
+            return
+        if self._prev_price is None or self._prev_sma is None:
+            return
+
+        if self._prev_price < self._prev_sma and tick_price >= cur_sma:
+            self._open_position(+1, tick_price)
+
+        elif self._prev_price > self._prev_sma and tick_price <= cur_sma:
+            self._open_position(-1, tick_price)
+
+    def _update_prev_state(self, price: Decimal, sma: Decimal):
+        """Persist current tick values for next tick's crossover comparison."""
+        self._prev_price = price
+        self._prev_sma   = sma
+
+    # ------------------------------------------------------------------
+    # End-of-day bookkeeping (called by run loop, mirrors LiveSMABot._check_eod)
     # ------------------------------------------------------------------
 
     def _update_pnl(self, close_price: Decimal):
         """
-        Book today's P&L into daily_assets.
-        Any open position is force-closed at the daily closing price (overnight rule).
+        Force-close any open position at the daily closing price (overnight rule),
+        then book the day's P&L into daily_assets.
         """
-        self._close_position(close_price)   # overnight rule: close at ATC price
+        self._close_position(close_price)
 
-        cur_asset = self.daily_assets[-1]
-        new_asset = cur_asset + self.realised_pnl
-        self.realised_pnl = Decimal('0')    # reset for next day
+        cur_asset    = self.daily_assets[-1]
+        new_asset    = cur_asset + self.realised_pnl
+        self.realised_pnl = Decimal('0')
 
         daily_return = new_asset / cur_asset - Decimal('1')
         self.daily_returns.append(daily_return)
         self.daily_assets.append(new_asset)
 
     # ------------------------------------------------------------------
-    # Data processing (unchanged from original — keeps F1/F2 merge logic)
+    # Data processing (unchanged)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -163,11 +205,7 @@ class Backtesting:
             f2_data = round_decimal(f2_data, col)
 
         f1_data = pd.merge(
-            f1_data,
-            f2_data,
-            on=["datetime", "date"],
-            how="outer",
-            sort=True,
+            f1_data, f2_data, on=["datetime", "date"], how="outer", sort=True,
         )
         f1_data = f1_data.ffill()
         return f1_data
@@ -179,14 +217,11 @@ class Backtesting:
     def run(self, data: pd.DataFrame, step: Decimal = Decimal('0.1')):
         """
         Iterate tick-by-tick through `data` and apply the SMA(1000) crossover strategy.
-
-        `step` is kept as a parameter for API compatibility but is not used by this
-        strategy (the limit-order price offset is 1 tick = 0.1 index point by convention).
+        Per-tick logic is delegated to private helpers, mirroring LiveSMABot.on_quote_update.
         """
-        trading_dates = data["date"].unique().tolist()
-
-        start_date = data["datetime"].iloc[0]
-        end_date   = data["datetime"].iloc[-1]
+        trading_dates    = data["date"].unique().tolist()
+        start_date       = data["datetime"].iloc[0]
+        end_date         = data["datetime"].iloc[-1]
         expiration_dates = get_expired_dates(start_date, end_date)
 
         cur_index    = 0
@@ -206,41 +241,29 @@ class Backtesting:
                 expiration_dates.get()
                 moving_to_f2 = True
 
-            # ---- update rolling SMA window ----
+            # 1. Update rolling SMA window
             self._price_window.append(tick_price)
             cur_sma = self._current_sma()
+            if cur_sma is None:
+                continue    # warming up
 
-            # ---- generate crossover signals (only when SMA is available) ----
-            if cur_sma is not None and self._prev_price is not None and self._prev_sma is not None:
-                prev_price = self._prev_price
-                prev_sma   = self._prev_sma
+            # 2. Take-profit / Stop-loss
+            #    Return value guards against same-tick re-entry, matching live behaviour.
+            tp_sl_fired = self._check_tp_sl(tick_price)
 
-                # --- check TP / SL on existing position first ---
-                if self.inventory != 0:
-                    upnl = self._unrealised_pnl(tick_price)
-                    if upnl >= TP_POINTS * MULTIPLIER or upnl <= -SL_POINTS * MULTIPLIER:
-                        self._close_position(tick_price)
+            # 3. Entry signals (skipped if TP/SL closed the position this tick)
+            if not tp_sl_fired:
+                self._check_signals(tick_price, cur_sma)
 
-                # --- crossover signal: open (or flip) position ---
-                if self.inventory == 0:
-                    # Buy signal: prev < SMA and cur >= SMA
-                    if prev_price < prev_sma and tick_price >= cur_sma:
-                        self._open_position(+1, tick_price)
-                    # Sell signal: prev > SMA and cur <= SMA
-                    elif prev_price > prev_sma and tick_price <= cur_sma:
-                        self._open_position(-1, tick_price)
+            # 4. Persist state for next tick's crossover comparison
+            self._update_prev_state(tick_price, cur_sma)
 
-            # ---- store previous-tick values for next iteration ----
-            self._prev_price = tick_price
-            self._prev_sma   = cur_sma
-
-            # ---- end-of-day bookkeeping ----
+            # 5. End-of-day bookkeeping
             is_last_tick_of_day = (
                 index == len(data) - 1
                 or row["date"] != data.iloc[index + 1]["date"]
             )
             if is_last_tick_of_day:
-                # Force-close any open position at today's close (overnight rule)
                 self._update_pnl(close_price)
 
                 if self.printable:
@@ -255,8 +278,8 @@ class Backtesting:
                 self.tracking_dates.append(row["date"])
                 self.daily_inventory.append(self.inventory)
 
-                # reset daily counters
-                moving_to_f2 = False
+                # Reset intraday state (mirrors live bot's per-day reset)
+                moving_to_f2     = False
                 self._prev_price = None
                 self._prev_sma   = None
                 self._price_window.clear()
@@ -264,25 +287,16 @@ class Backtesting:
 
         self.metric = Metric(self.daily_returns, None)
 
+    # ------------------------------------------------------------------
+    # Plotting helpers (unchanged)
+    # ------------------------------------------------------------------
+
     def plot_hpr(self, path="result/backtest/hpr.svg"):
-        """
-        Plot and save NAV chart to path
-
-        Args:
-            path (str, optional): _description_. Defaults to "result/backtest/hpr.svg".
-        """
         plt.figure(figsize=(10, 6))
-
-        assets = pd.Series(self.daily_assets)
+        assets    = pd.Series(self.daily_assets)
         ac_return = assets.apply(lambda x: x / assets.iloc[0])
         ac_return = [(val - 1) * 100 for val in ac_return.to_numpy()[1:]]
-        plt.plot(
-            self.tracking_dates,
-            ac_return,
-            label="Portfolio",
-            color='black',
-        )
-
+        plt.plot(self.tracking_dates, ac_return, label="Portfolio", color='black')
         plt.title('Holding Period Return Over Time')
         plt.xlabel('Time Step')
         plt.ylabel('Holding Period Return (%)')
@@ -291,22 +305,9 @@ class Backtesting:
         plt.savefig(path, dpi=300, bbox_inches='tight')
 
     def plot_drawdown(self, path="result/backtest/drawdown.svg"):
-        """
-        Plot and save drawdown chart to path
-
-        Args:
-            path (str, optional): _description_. Defaults to "result/backtest/drawdown.svg".
-        """
         _, drawdowns = self.metric.maximum_drawdown()
-
         plt.figure(figsize=(10, 6))
-        plt.plot(
-            self.tracking_dates,
-            drawdowns,
-            label="Portfolio",
-            color='black',
-        )
-
+        plt.plot(self.tracking_dates, drawdowns, label="Portfolio", color='black')
         plt.title('Draw down Value Over Time')
         plt.xlabel('Time Step')
         plt.ylabel('Percentage')
@@ -315,13 +316,7 @@ class Backtesting:
 
     def plot_inventory(self, path="result/backtest/inventory.svg"):
         plt.figure(figsize=(10, 6))
-        plt.plot(
-            self.tracking_dates,
-            self.daily_inventory,
-            label="Portfolio",
-            color='black',
-        )
-
+        plt.plot(self.tracking_dates, self.daily_inventory, label="Portfolio", color='black')
         plt.title('Inventory Value Over Time')
         plt.xlabel('Time Step')
         plt.grid(True)
@@ -330,28 +325,22 @@ class Backtesting:
 
 
 if __name__ == "__main__":
-    bt = Backtesting(
-        capital=Decimal("5e5"),
-    )
+    import numpy as np
 
+    bt   = Backtesting(capital=Decimal("5e5"))
     data = bt.process_data()
-    bt.run(data)   # step param not used by SMA crossover strategy
+    bt.run(data)
 
-    print(
-        f"Sharpe ratio: {bt.metric.sharpe_ratio(risk_free_return=Decimal('0.00023')) * Decimal(np.sqrt(250))}"
-    )
-    print(
-        f"Sortino ratio: {bt.metric.sortino_ratio(risk_free_return=Decimal('0.00023')) * Decimal(np.sqrt(250))}"
-    )
+    print(f"Sharpe ratio:    {bt.metric.sharpe_ratio(risk_free_return=Decimal('0.00023')) * Decimal(np.sqrt(250))}")
+    print(f"Sortino ratio:   {bt.metric.sortino_ratio(risk_free_return=Decimal('0.00023')) * Decimal(np.sqrt(250))}")
     mdd, _ = bt.metric.maximum_drawdown()
     print(f"Maximum drawdown: {mdd}")
 
     monthly_df = pd.DataFrame(bt.monthly_tracking, columns=["date", "asset"])
-    returns = get_returns(monthly_df)
-
-    print(f"HPR {bt.metric.hpr()}")
+    returns    = get_returns(monthly_df)
+    print(f"HPR            {bt.metric.hpr()}")
     print(f"Monthly return {returns['monthly_return']}")
-    print(f"Annual return {returns['annual_return']}")
+    print(f"Annual return  {returns['annual_return']}")
 
     bt.plot_hpr()
     bt.plot_drawdown()
